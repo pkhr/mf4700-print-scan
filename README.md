@@ -11,7 +11,8 @@ AirPrint printer "Canon MF4780w", and anything you scan on the MF lands as a PDF
 your Desktop and opens. Quitting it stops both.
 
 **[Download the latest release](https://github.com/pkhr/mf4700-print-scan/releases/latest)**:
-a disk image with the app, for macOS 14 or later on Apple silicon or Intel. The app
+a disk image with the app, for macOS 14 or later on Apple silicon or Intel. Or with
+[Homebrew](https://brew.sh): `brew install --cask pkhr/tap/mf4700-print-scan`. The app
 reaches the printer over the network (Wi-Fi or Ethernet); USB is not supported. It
 was developed with an MF4780w on macOS 27.
 
@@ -37,7 +38,7 @@ any app → macOS AirPrint driver → localhost:8631 (ippeveprinter, started by 
 ## Use
 
 1. Open the disk image, drag **Canon MF4780w Print & Scan** to Applications and open
-   it. The app is not notarized, so macOS blocks the first launch: click **Open
+   it (or install it with Homebrew, above). The app is not notarized, so macOS blocks the first launch: click **Open
    Anyway** in System Settings → Privacy & Security, then open it again. Allow it to
    find devices on your local network when macOS asks.
 2. The first time, click **Add to Mac** in its panel, or add "Canon MF4780w" in
