@@ -13,14 +13,12 @@ import SystemConfiguration
 final class ScanController: ObservableObject {
     static let shared = ScanController()
 
-    struct Page { let image: CGImage; let width: Int; let height: Int; let dpi: Int }
-
     enum Phase: Equatable {
         case starting                            // Start pressed, waiting for the session
         case scanning(feeder: Bool, pages: Int)  // pages finished so far
     }
 
-    @Published var phase: Phase?
+    @Published var phase: Phase? { didSet { awake.hold(phase != nil) } }
     @Published var listedAs: String?             // this Mac's entry under SCAN → Computer
     @Published var lastScan: URL? = UserDefaults.standard.url(forKey: "LastScan")
         .flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil } {
@@ -42,15 +40,25 @@ final class ScanController: ObservableObject {
     private var timer: Timer?
     private var listener: Process?               // mfnpscan --wait
     private var listenerAddress: String?
-    private var listenAgain = Date.distantPast
+    private var listenAgain: TimeInterval = 0     // monotonic (systemUptime): immune to clock changes
     private var stoppingListener = false
     private var unreachable = 0                  // listener runs that found no printer
+    private var lastReply = ""                   // the printer's last Notify reply, as logged
+    private let awake = KeepAwake("Scanning")
+    private static let saveQueue = DispatchQueue(label: "scan-save", qos: .userInitiated)
+    private(set) var saving = 0                  // PDFs being written: Quit waits for them
+    private var afterSaving: [() -> Void] = []
+
+    /// Run `done` once no PDF is being written (now, if none is).
+    func whenSaved(_ done: @escaping () -> Void) {
+        if saving == 0 { done() } else { afterSaving.append(done) }
+    }
 
     func start() {
         // settings of the Remote Scanner mode that earlier versions used
         UserDefaults.standard.removeObject(forKey: "ScanQuietUntil")
         UserDefaults.standard.removeObject(forKey: "WatchForScans")
-        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.listen() }
+        timer = Timer.scheduledTimer(withTimeInterval: 3 * timeScale, repeats: true) { [weak self] _ in self?.listen() }
         timer?.tolerance = 1
     }
 
@@ -63,13 +71,16 @@ final class ScanController: ObservableObject {
         guard let listener else { return }
         stoppingListener = true
         listener.terminate()                     // mfnpscan unregisters this Mac, then exits
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20 * timeScale) {
+            if listener.isRunning { kill(listener.processIdentifier, SIGKILL) }
+        }
     }
 
     /// Stop the scan in progress. mfnpscan ends the session and keeps the pages it finished.
     func cancelScan() {
         guard scanning, let p = listener else { return }
         p.terminate()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8 * timeScale) {
             if p.isRunning { kill(p.processIdentifier, SIGKILL) }
         }
     }
@@ -81,7 +92,7 @@ final class ScanController: ObservableObject {
             if listenerAddress != ip && !scanning { stopListener() }   // the printer moved
             return
         }
-        guard Date() >= listenAgain else { return }
+        guard ProcessInfo.processInfo.systemUptime >= listenAgain else { return }
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("scan-\(UUID().uuidString)")
         let p = Process()
         p.executableURL = URL(fileURLWithPath: scanner)
@@ -89,34 +100,44 @@ final class ScanController: ObservableObject {
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
-        var output = "", partial = ""
+        // The listener is over once it exited AND all its output was read: the last
+        // PAGE lines may still be in the pipe when the exit is reported.
+        var output = "", partial = "", exited = false, drained = false     // main thread only
+        func finish() {
+            guard exited && drained else { return }
+            p.terminationHandler = nil           // it holds this function: let the process go
+            listenerEnded(p, output: output + partial, dir: dir)
+        }
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty else { return }
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                DispatchQueue.main.async { drained = true; finish() }   // after the output blocks
+                return
+            }
             let text = String(decoding: data, as: UTF8.self)
             DispatchQueue.main.async {
-                output += text
                 partial += text
                 while let nl = partial.firstIndex(of: "\n") {
-                    self?.listenerSaid(String(partial[..<nl]))
+                    let line = String(partial[..<nl])
                     partial.removeSubrange(...nl)
+                    // the scan's trace starts at Start; before it (days, maybe) keep only recent replies
+                    if line.hasPrefix("EVENT") { output = "" }
+                    else if self?.phase == nil && output.utf8.count > 64_000 { output = String(output.suffix(16_000)) }
+                    output += line + "\n"
+                    self?.listenerSaid(line)
                 }
             }
         }
-        p.terminationHandler = { [weak self] proc in
-            pipe.fileHandleForReading.readabilityHandler = nil
-            let rest = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            DispatchQueue.main.async {
-                output += rest
-                self?.listenerEnded(proc, output: output, dir: dir)
-            }
-        }
+        p.terminationHandler = { _ in DispatchQueue.main.async { exited = true; finish() } }
         do {
             try p.run()
             listener = p
             listenerAddress = ip
         } catch {
-            listenAgain = Date().addingTimeInterval(60)
+            pipe.fileHandleForReading.readabilityHandler = nil
+            p.terminationHandler = nil
+            listenAgain = ProcessInfo.processInfo.systemUptime + 60 * timeScale
             Bridge.shared.logLine("cannot start the scan listener: \(error.localizedDescription)")
         }
     }
@@ -131,7 +152,8 @@ final class ScanController: ObservableObject {
                 bridge.logLine("listed under SCAN → Computer as \(name)")
             }
         } else if line.hasPrefix("notify ") || line.hasPrefix("INFO: the printer refused") {
-            bridge.logLine("scan listener: \(line)")     // the printer's replies, when they change
+            if line != lastReply { bridge.logLine("scan listener: \(line)") }   // the printer's replies, when they change
+            lastReply = line
         } else if line.hasPrefix("EVENT") {
             phase = .starting
             bridge.logLine("Start pressed for this Mac: \(line)")
@@ -147,86 +169,134 @@ final class ScanController: ObservableObject {
         let pressed = phase != nil
         listener = nil
         phase = nil
-        defer { try? FileManager.default.removeItem(at: dir) }
         let bridge = Bridge.shared
         let stopped = stoppingListener
         stoppingListener = false
-        guard proc.terminationReason == .exit else {
-            if !stopped {
-                bridge.logLine("scan listener crashed (signal \(proc.terminationStatus))")
-                listenAgain = Date().addingTimeInterval(10)
-            }
-            return
+        let crashed = proc.terminationReason != .exit
+        let status = crashed ? -1 : proc.terminationStatus
+        if crashed && !stopped {
+            bridge.logLine("scan listener crashed (signal \(proc.terminationStatus))")
+            listenAgain = ProcessInfo.processInfo.systemUptime + 10 * timeScale
         }
-        let status = proc.terminationStatus
-        if pressed {
+        if pressed && status != 0 {                     // the scan's trace, minus the per-block exchanges
             bridge.logLine("SCAN → Computer exit \(status), trace:\n"
-                           + output.split(separator: "\n").filter { !$0.hasPrefix("tcp < hdr") }.joined(separator: "\n"))
+                           + output.split(separator: "\n").filter { !Self.isChatter($0) }.joined(separator: "\n"))
         }
         if status == 4 {                                                // the printer stopped answering
             listedAs = nil
-            listenAgain = Date().addingTimeInterval(30)
+            listenAgain = ProcessInfo.processInfo.systemUptime + 30 * timeScale
             unreachable += 1
             // SNMP (Apple's snmpget) reaches the printer but our helper can't:
             // macOS Local Network privacy is blocking the app.
             if unreachable == 2 && bridge.printerAddress != nil {
                 bridge.note(.warning, "Can't reach the scanner. Allow this app in System Settings → Privacy & Security → Local Network.")
             }
+        } else if status > 0 {
+            listenAgain = ProcessInfo.processInfo.systemUptime + 5 * timeScale
+        }
+        guard pressed, status != 2 else {
+            if pressed { bridge.note(.warning, "The printer did not start the scan") }
+            try? FileManager.default.removeItem(at: dir)
             return
         }
-        if status != 0 { listenAgain = Date().addingTimeInterval(5) }
-        guard pressed else { return }
-        if status == 2 {
-            bridge.note(.warning, "The printer did not start the scan")
-        } else {
-            conclude(status, output: output)
-        }
+        conclude(status, output: output, dir: dir)
+    }
+
+    /// mfnpscan -v's per-block protocol exchanges: too many to log.
+    static func isChatter(_ line: Substring) -> Bool {
+        line.hasPrefix("tcp ") || line.hasPrefix("udp ") || line.hasPrefix("block hdr") || line.hasPrefix("reply (")
     }
 
     /// Save the pages mfnpscan finished (also those before a failed page), open the
-    /// PDF, and say how it went.
-    private func conclude(_ status: Int32, output: String) {
+    /// PDF, and say how it went. The PDF is written off the main thread: the first
+    /// save may wait for the user to answer macOS's question about the Desktop.
+    private func conclude(_ status: Int32, output: String, dir: URL) {
+        let pages = Self.pageList(output)
+        let error = output.split(separator: "\n").last { $0.hasPrefix("ERROR: ") }.map { String($0.dropFirst(7)) }
+        saving += 1
+        Self.saveQueue.async {
+            let saved = Self.savePDF(pages, draft: dir.appendingPathComponent("scan.pdf"))
+            DispatchQueue.main.async { self.concluded(status, saved: saved, error: error, dir: dir) }
+        }
+    }
+
+    private func concluded(_ status: Int32, saved: Result<SavedScan?, Error>, error: String?, dir: URL) {
         let bridge = Bridge.shared
-        let url = save(output, required: status == 0)
-        let kept = url != nil ? "; the pages scanned before it are saved" : ""
+        let fm = FileManager.default
+        var url: URL?, unsaved: String?
+        defer {
+            saving -= 1
+            if saving == 0 {
+                let waiting = afterSaving
+                afterSaving = []
+                waiting.forEach { $0() }
+            }
+        }
+        switch saved {
+        case .success(let scan?):
+            url = scan.url
+            lastScan = scan.url
+            bridge.note(.ok, "Saved “\(scan.url.lastPathComponent)” (\(scan.pages) page\(scan.pages == 1 ? "" : "s"))"
+                             + (scan.inAppFolder ? " in the app's folder: the Desktop was not available" : ""))
+            #if !SOAK
+            NSSound(named: "Glass")?.play()
+            #endif
+            try? fm.removeItem(at: dir)
+        case .success(nil):
+            if status == 0 { bridge.note(.error, "The scanner sent no pages") }
+            try? fm.removeItem(at: dir)
+        case .failure(let e):
+            // no PDF could be written anywhere: keep the pages rather than lose the scan
+            var kept = bridge.support.appendingPathComponent("Unsaved Scans/\(dir.lastPathComponent)")
+            try? fm.createDirectory(at: kept.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if (try? fm.moveItem(at: dir, to: kept)) == nil { kept = dir }      // then they stay where they are
+            unsaved = "could not save the PDF (\(e.localizedDescription)); the pages are in \(kept.path)"
+        }
+        let kept = url != nil ? "; the pages scanned before it are saved" : unsaved.map { "; \($0)" } ?? ""
         switch status {
         case 0:
-            break
+            if let unsaved { bridge.note(.error, unsaved.prefix(1).uppercased() + unsaved.dropFirst()) }
         case 5:
             bridge.note(.error, "The printer stopped the scan (paper jam or Stop key)\(kept)")
         case 6:
             bridge.note(.warning, "Scan cancelled\(kept)")
         default:
-            let errors = output.split(separator: "\n").filter { $0.hasPrefix("ERROR: ") }
-            bridge.note(.error, "Scan failed: \(errors.last.map { String($0.dropFirst(7)) } ?? "see log")\(kept)")
+            bridge.note(.error, "Scan failed: \(error ?? "see log")\(kept)")
         }
+        #if !SOAK
         if let url { NSWorkspace.shared.open(url) }
+        #endif
     }
 
-    /// Turn mfnpscan's PAGE lines into a PDF on the Desktop.
-    private func save(_ output: String, required: Bool) -> URL? {
-        let bridge = Bridge.shared
-        // "PAGE <n> <path> <width> <height> <dpi>"
-        let list: [(String, Int)] = output.split(separator: "\n").compactMap { line in
+    struct SavedScan { let url: URL; let pages: Int; let inAppFolder: Bool }
+
+    /// The PDF is written as `draft` next to the pages, then moved to the Desktop,
+    /// else (no permission, ...) to the app's folder: an interrupted save never
+    /// leaves half a PDF on the Desktop.
+    static func savePDF(_ pages: [(String, Int)], draft: URL) -> Result<SavedScan?, Error> {
+        Result {
+            guard let count = try writePDF(pages, to: draft) else { return nil }
+            let fm = FileManager.default
+            do {
+                let url = newScanURL(in: scanFolder())
+                try fm.moveItem(at: draft, to: url)
+                return SavedScan(url: url, pages: count, inAppFolder: false)
+            } catch {
+                let folder = Bridge.shared.support.appendingPathComponent("Scans", isDirectory: true)
+                try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+                let url = newScanURL(in: folder)
+                try fm.moveItem(at: draft, to: url)
+                return SavedScan(url: url, pages: count, inAppFolder: true)
+            }
+        }
+    }
+
+    /// mfnpscan's "PAGE <n> <path> <width> <height> <dpi>" lines.
+    static func pageList(_ output: String) -> [(String, Int)] {
+        output.split(separator: "\n").compactMap { line in
             let f = line.split(separator: " ")
             guard f.first == "PAGE", f.count >= 6, let dpi = Int(f[f.count - 1]) else { return nil }
             return (f[2..<(f.count - 3)].joined(separator: " "), dpi)
-        }
-        let pages = Self.loadPages(list)
-        guard !pages.isEmpty else {
-            if required { bridge.note(.error, "The scanner sent no pages") }
-            return nil
-        }
-        do {
-            let url = Self.newScanURL()
-            try Self.writePDF(pages, to: url)
-            lastScan = url
-            bridge.note(.ok, "Saved “\(url.lastPathComponent)” (\(pages.count) page\(pages.count == 1 ? "" : "s"))")
-            NSSound(named: "Glass")?.play()
-            return url
-        } catch {
-            bridge.note(.error, "Could not save the PDF: \(error.localizedDescription)")
-            return nil
         }
     }
 
@@ -235,9 +305,18 @@ final class ScanController: ObservableObject {
         var errorDescription: String? { "cannot create the PDF file" }
     }
 
-    static func newScanURL() -> URL {
+    static func scanFolder() -> URL {
+        #if SOAK
+        let folder = Bridge.shared.support.appendingPathComponent("scans", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder
+        #else
+        return FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0]
+        #endif
+    }
+
+    static func newScanURL(in desktop: URL) -> URL {
         let fm = FileManager.default
-        let desktop = fm.urls(for: .desktopDirectory, in: .userDomainMask)[0]
         let format = DateFormatter()
         format.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
         let stem = "Scan \(format.string(from: Date()))"
@@ -250,35 +329,41 @@ final class ScanController: ObservableObject {
         return url
     }
 
-    static func loadPages(_ list: [(String, Int)]) -> [Page] {
-        list.compactMap { path, dpi in
-            guard let raw = loadPNM(path), let image = jpeg(raw) else { return nil }
-            return Page(image: image, width: raw.width, height: raw.height, dpi: dpi)
+    /// Write the pages to a PDF, one at a time: a full colour page is 26 MB of
+    /// pixels, and a feeder holds 35 sheets. Returns the page count, nil without pages.
+    static func writePDF(_ list: [(String, Int)], to url: URL) throws -> Int? {
+        var ctx: CGContext?, pages = 0
+        for (path, dpi) in list {
+            try autoreleasepool {
+                guard let raw = loadPNM(path), let image = jpeg(raw) else { return }
+                if ctx == nil {
+                    guard let c = CGContext(url as CFURL, mediaBox: nil, nil) else { throw ScanError.cannotCreate }
+                    ctx = c
+                }
+                var box = CGRect(x: 0, y: 0, width: CGFloat(raw.width) * 72 / CGFloat(dpi),
+                                 height: CGFloat(raw.height) * 72 / CGFloat(dpi))
+                ctx?.beginPage(mediaBox: &box)
+                ctx?.draw(image, in: box)
+                ctx?.endPage()
+                pages += 1
+            }
         }
-    }
-
-    static func writePDF(_ pages: [Page], to url: URL) throws {
-        guard let ctx = CGContext(url as CFURL, mediaBox: nil, nil) else { throw ScanError.cannotCreate }
-        for page in pages {
-            var box = CGRect(x: 0, y: 0, width: CGFloat(page.width) * 72 / CGFloat(page.dpi),
-                             height: CGFloat(page.height) * 72 / CGFloat(page.dpi))
-            ctx.beginPage(mediaBox: &box)
-            ctx.draw(page.image, in: box)
-            ctx.endPage()
-        }
-        ctx.closePDF()
+        ctx?.closePDF()
+        return pages > 0 ? pages : nil
     }
 
     /// P5 (gray) / P6 (RGB) 8-bit, as written by mfnpscan.
     static func loadPNM(_ path: String) -> CGImage? {
-        guard let data = FileManager.default.contents(atPath: path) else { return nil }
-        let bytes = [UInt8](data)
+        // mapped, not read: only the pixels are copied, once
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped) else { return nil }
         var fields: [String] = [], i = 0
-        while fields.count < 4, i < bytes.count {
-            while i < bytes.count, bytes[i] == 0x20 || bytes[i] == 0x0a || bytes[i] == 0x0d || bytes[i] == 0x09 { i += 1 }
+        let header = data.prefix(64)
+        func space(_ b: UInt8) -> Bool { b == 0x20 || b == 0x0a || b == 0x0d || b == 0x09 }
+        while fields.count < 4, i < header.count {
+            while i < header.count, space(header[i]) { i += 1 }
             var token = ""
-            while i < bytes.count, !(bytes[i] == 0x20 || bytes[i] == 0x0a || bytes[i] == 0x0d || bytes[i] == 0x09) {
-                token.append(Character(UnicodeScalar(bytes[i])))
+            while i < header.count, !space(header[i]) {
+                token.append(Character(UnicodeScalar(header[i])))
                 i += 1
             }
             fields.append(token)
@@ -286,8 +371,8 @@ final class ScanController: ObservableObject {
         i += 1                                     // single whitespace before the pixels
         guard fields.count == 4, let w = Int(fields[1]), let h = Int(fields[2]), fields[3] == "255" else { return nil }
         let channels = fields[0] == "P6" ? 3 : 1
-        guard bytes.count >= i + w * h * channels,
-              let provider = CGDataProvider(data: Data(bytes[i..<(i + w * h * channels)]) as CFData),
+        guard w > 0, h > 0, data.count >= i + w * h * channels,
+              let provider = CGDataProvider(data: data.subdata(in: i..<(i + w * h * channels)) as CFData),
               let space = channels == 3 ? CGColorSpace(name: CGColorSpace.sRGB) : CGColorSpace(name: CGColorSpace.genericGrayGamma2_2)
         else { return nil }
         return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 8 * channels, bytesPerRow: w * channels,

@@ -4,5 +4,5 @@
 /mfnpscan
 *.o
 .DS_Store
-/tools/__pycache__/
+__pycache__/
 /tools/mkraster

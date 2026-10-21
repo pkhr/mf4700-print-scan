@@ -128,6 +128,7 @@ final class PanelWindow: NSObject, NSWindowDelegate {
     private var window: NSWindow?
 
     func show() {
+        Bridge.shared.refreshQueue()                      // "Add to Mac" or the check mark
         if window == nil {
             let w = NSWindow(contentRect: NSRect(origin: .zero, size: PanelView.size),
                              styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
@@ -155,6 +156,11 @@ final class PanelWindow: NSObject, NSWindowDelegate {
             w.setFrameAutosaveName("Panel")
             window = w
         }
+        #if SOAK
+        window?.alphaValue = 0                            // rendered, but invisible and never in the way
+        window?.ignoresMouseEvents = true
+        window?.orderFrontRegardless()
+        #else
         NSApp.setActivationPolicy(.regular)               // back in the Dock
         NSApp.activate(ignoringOtherApps: true)
         if window?.isMiniaturized == true { window?.deminiaturize(nil) }
@@ -164,6 +170,7 @@ final class PanelWindow: NSObject, NSWindowDelegate {
             self?.window?.makeKeyAndOrderFront(nil)
             self?.fitFrame()
         }
+        #endif
     }
 
     /// Closed (not minimized): leave the Dock, keep the menu-bar icon.
@@ -182,6 +189,10 @@ final class PanelWindow: NSObject, NSWindowDelegate {
     }
 
     var isVisible: Bool { window?.isVisible == true }
+
+    #if SOAK
+    func close() { window?.close() }
+    #endif
 }
 
 func openPrinterSettings() {
@@ -218,7 +229,11 @@ final class StatusItem: NSObject, NSMenuDelegate {
 
     private func refresh() {
         let m = PanelModel.live(Bridge.shared, ScanController.shared)
+        #if SOAK
+        item?.isVisible = false
+        #else
         item?.isVisible = Bridge.shared.activeJob == nil
+        #endif
         item?.button?.toolTip = "\(printerName) — \(m.title)"
         guard m.tone.symbol != symbol else { return }
         symbol = m.tone.symbol
@@ -328,6 +343,7 @@ enum MainMenu {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sigterm: DispatchSourceSignal?
+    private var quitBySignal = false
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         LoginItem.noteLaunchEvent()
@@ -337,13 +353,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Quit cleanly on SIGTERM too (logout, kill): stop the server and withdraw the advert.
         signal(SIGTERM, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-        source.setEventHandler { NSApp.terminate(nil) }
+        source.setEventHandler { [weak self] in
+            self?.quitBySignal = true
+            NSApp.terminate(nil)
+        }
         source.resume()
         sigterm = source
         Bridge.shared.start()
         ScanController.shared.start()
         StatusItem.shared.start()
+        #if SOAK
+        // -SoakPanelToggle N: open and close the (invisible) panel every N seconds
+        let toggle = UserDefaults.standard.double(forKey: "SoakPanelToggle")
+        if toggle > 0 {
+            PanelWindow.shared.show()
+            Timer.scheduledTimer(withTimeInterval: toggle, repeats: true) { _ in
+                if PanelWindow.shared.isVisible { PanelWindow.shared.close() } else { PanelWindow.shared.show() }
+            }
+        }
+        #else
         if !LoginItem.launchedAtLogin { PanelWindow.shared.show() }
+        #endif
     }
 
     /// Closing the window keeps the app (and the printer) running in the Dock and menu bar.
@@ -356,16 +386,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let busy = Bridge.shared.activeJob.map { "“\($0)” is still being sent to the printer." }
-            ?? (ScanController.shared.scanning ? "A scan is in progress." : nil)
-        guard let busy else { return .terminateNow }
-        NSApp.activate(ignoringOtherApps: true)            // also when only in the menu bar
-        let alert = NSAlert()
-        alert.messageText = busy
-        alert.informativeText = "If you quit now, it may be lost."
-        alert.addButton(withTitle: "Keep Going")
-        alert.addButton(withTitle: "Quit Anyway")
-        return alert.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
+        #if SOAK
+        return .terminateNow
+        #else
+        // logout, restart, shutdown or SIGTERM: never hold them up with a question
+        let byUser = !(quitBySignal || Self.systemIsQuitting)
+        if byUser, let busy = Bridge.shared.activeJob.map({ "“\($0)” is still being sent to the printer." })
+            ?? (ScanController.shared.scanning ? "A scan is in progress." : nil) {
+            NSApp.activate(ignoringOtherApps: true)        // also when only in the menu bar
+            let alert = NSAlert()
+            alert.messageText = busy
+            alert.informativeText = "If you quit now, it may be lost."
+            alert.addButton(withTitle: "Keep Going")
+            alert.addButton(withTitle: "Quit Anyway")
+            if alert.runModal() != .alertSecondButtonReturn { return .terminateCancel }
+        }
+        // a scan's PDF is being written: a few seconds, then quit (15 s at most)
+        guard ScanController.shared.saving > 0 else { return .terminateNow }
+        var replied = false
+        let reply = {
+            guard !replied else { return }
+            replied = true
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        ScanController.shared.whenSaved(reply)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: reply)
+        return .terminateLater
+        #endif
+    }
+
+    /// macOS's quit event at logout, restart and shutdown carries the reason.
+    private static var systemIsQuitting: Bool {
+        guard let event = NSAppleEventManager.shared().currentAppleEvent, event.eventID == kAEQuitApplication,
+              let why = event.attributeDescriptor(forKeyword: kAEQuitReason) ?? event.paramDescriptor(forKeyword: kAEQuitReason)
+        else { return false }
+        return [kAEQuitAll, kAELogOut, kAEReallyLogOut, kAEShowRestartDialog, kAEShowShutdownDialog, kAERestart, kAEShutDown]
+            .contains(why.typeCodeValue)
     }
 
     func applicationWillTerminate(_ notification: Notification) {

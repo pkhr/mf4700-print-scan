@@ -105,6 +105,16 @@ make test       # byte-exact check against Canon's driver output (needs jbigkit)
 Building needs the Xcode command line tools. `make test` also needs JBIG-KIT's
 `jbgtopbm` (`brew install jbigkit`).
 
+Soak test: `test/soak/build.sh` builds a test copy of the app ("MF4700 Soak Test",
+its own port, folders and Bonjour name, timers 20x faster), and
+`python3 test/soak/soak.py --minutes 60 --leaks` runs it against a fake MF4700 on
+127.0.0.1 (`test/soak/fakeprinter.py`: raw print port, SNMP agent, MFNP scanner).
+It prints and scans continuously, injects faults (AirPrint server and scan listener
+crashes, printer, SNMP and scanner outages, paper jams, dropped connections, refused
+registrations), checks every job and scan against the app's log, samples memory,
+threads, file descriptors and CPU of the whole process tree, and runs `leaks`.
+`test/soak/build.sh --tsan` builds it with Thread Sanitizer (`--build build/soak-tsan`).
+
 The disk image opens as an installer window: the app, an arrow and the Applications
 folder on a background rendered by `app/Snapshot/Snapshot.swift`, laid out by
 [dmgbuild](https://github.com/dmgbuild/dmgbuild) (`app/dmg-settings.py`; installed
@@ -132,6 +142,9 @@ Settings → Printers & Scanners.
   job) and reads status with `/usr/bin/snmpget`.
 * `ippeveprinter` invents a new printer UUID on every start. The app pins one, so
   the Mac's queue (`dnssd://…?uuid=`) keeps working across launches.
+* Cancelling a job in the Mac's print queue stops it only before it starts:
+  `ippeveprinter` cannot stop a print command that is already running, so a job
+  that has started printing finishes.
 * `app/Resources/printer-large.png` (panel) and `printer.png` (the AirPrint
   printer's icon) are an illustration of the MF4700 series generated with Google's
   Nano Banana Pro (Gemini 3.1 Pro image model), using Canon's product render only as

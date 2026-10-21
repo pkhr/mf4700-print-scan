@@ -1,0 +1,19 @@
+# Print-Job with a job name and copies, for the soak test:
+#   ipptool -d jobname=NAME -d copies=N -f page.pwg ipp://localhost:PORT/ipp/print print-job.test
+{
+	NAME "Print-Job"
+	OPERATION Print-Job
+	GROUP operation-attributes-tag
+	ATTR charset attributes-charset utf-8
+	ATTR language attributes-natural-language en
+	ATTR uri printer-uri $uri
+	ATTR name requesting-user-name $user
+	ATTR name job-name $jobname
+	ATTR mimeMediaType document-format image/pwg-raster
+	GROUP job-attributes-tag
+	ATTR integer copies $copies
+	FILE $filename
+	STATUS successful-ok
+	STATUS successful-ok-ignored-or-substituted-attributes
+	EXPECT job-id
+}

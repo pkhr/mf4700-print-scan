@@ -43,9 +43,20 @@
 #define EXIT_UNREACHABLE 4
 #define EXIT_STOPPED 5
 #define EXIT_CANCELLED 6
+#define MAX_PAGES 100                             /* the feeder holds 35 sheets */
 
 static int verbose;
 static int reply_ms = 10000;                      /* per TCP reply (SANE waits 8 s) */
+static double time_scale = 1;                     /* MFNPSCAN_TIME_SCALE: faster waits for soak tests */
+
+static void sleep_ms(double ms) { usleep((useconds_t)(ms * time_scale * 1000)); }
+
+/* Seconds for timeouts: monotonic, so a clock change can't end or stretch a wait. */
+static time_t mono(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec;
+}
 static volatile sig_atomic_t cancelled;
 
 static void on_cancel(int sig) { (void)sig; cancelled = 1; }
@@ -93,7 +104,8 @@ static void set_hdr(mfnp_t *m, mfnp_hdr_t *h, uint8_t cmd, uint32_t len) {
   h->dev_type = 2;
   h->cmd = cmd;
   h->status = 0;
-  h->seq = htons(++m->seq);
+  if (++m->seq == 0) m->seq = 1;                  /* wraps every few days of polling; skip 0 */
+  h->seq = htons(m->seq);
   h->session = htons(m->session);
   h->len = htonl(len);
   m->last_cmd = cmd;
@@ -115,7 +127,7 @@ static int udp_cmd(mfnp_t *m, uint8_t cmd, const void *payload, size_t plen, uin
       return -1;
     }
     struct pollfd p = { m->udp, POLLIN, 0 };
-    while (poll(&p, 1, 1500) > 0) {
+    while (poll(&p, 1, (int)(1500 * time_scale) + 1) > 0) {
       ssize_t n = recv(m->udp, resp, rmax, 0);
       if (n < (ssize_t)sizeof(mfnp_hdr_t)) continue;
       mfnp_hdr_t *r = (mfnp_hdr_t *)resp;
@@ -219,7 +231,7 @@ static int tcp_write(mfnp_t *m, const uint8_t *data, size_t n) {
   hexdump("tcp >", buf, sizeof(mfnp_hdr_t) + n);
   if (send(m->tcp, buf, sizeof(mfnp_hdr_t) + n, 0) != (ssize_t)(sizeof(mfnp_hdr_t) + n)) return -1;
   uint32_t len;
-  uint8_t ack[4];
+  uint8_t ack[4] = {0};
   if (recv_hdr(m, &len)) return -1;
   if (len != 4) {                                 /* device refused the command */
     fprintf(stderr, "ERROR: scanner refused command %02x%02x (%u-byte ack)\n", data[0], data[1], len);
@@ -354,7 +366,14 @@ static uint8_t *scan_page(mfnp_t *m, const scanparam_t *p, int *lines, uint8_t *
   size_t stride = (size_t)p->raw_w * p->channels, cap = stride * p->h, have = 0;
   uint8_t *img = malloc(cap + 0x10000);
   uint8_t info = 0, *chunk = malloc(0x10000);
-  time_t progress = time(NULL);                    /* last time the scanner sent data */
+  if (!img || !chunk) {
+    fprintf(stderr, "ERROR: out of memory for a %zu-byte page\n", cap);
+    free(img);
+    free(chunk);
+    *rc = 1;
+    return NULL;
+  }
+  time_t progress = mono();                    /* last time the scanner sent data */
   int failure = 1;
   for (;;) {
     if (cancelled) { failure = EXIT_CANCELLED; goto fail; }
@@ -379,7 +398,7 @@ static uint8_t *scan_page(mfnp_t *m, const scanparam_t *p, int *lines, uint8_t *
         failure = EXIT_STOPPED;
         goto fail;
       }
-      if (m->timed_out || time(NULL) - progress > 20) {
+      if (m->timed_out || mono() - progress > 20) {
         fprintf(stderr, "ERROR: the scanner stopped responding after %zu bytes (paper jam?)\n", have);
         goto fail;
       }
@@ -402,12 +421,12 @@ static uint8_t *scan_page(mfnp_t *m, const scanparam_t *p, int *lines, uint8_t *
     }
     if (info & 0x38) break;                       /* end of page */
     if (!first && left == 0) {                    /* nothing yet: scanner still moving */
-      if (time(NULL) - progress > 30) {
+      if (mono() - progress > 30) {
         fprintf(stderr, "ERROR: the scanner stopped sending data after %zu bytes (paper jam?)\n", have);
         goto fail;
       }
       usleep(100000);
-    } else progress = time(NULL);
+    } else progress = mono();
   }
   free(chunk);
   *lines = (int)(have / stride);
@@ -496,7 +515,7 @@ static int wait_for_start(mfnp_t *m, uint8_t *key) {
   int listed = 0, failures = 0, wait = 0;
   pid_t parent = getppid();
   for (;;) {
-    for (int i = 0; i < wait * 10 && !cancelled; i++) usleep(100000);
+    for (int i = 0; i < wait * 10 && !cancelled; i++) sleep_ms(100);
     if (cancelled || getppid() != parent) {        /* app quit or scanning switched off */
       if (listed) notify(m, &d, NOTIFY_CANCEL);
       return cancelled ? EXIT_CANCELLED : 1;
@@ -539,6 +558,7 @@ static int wait_for_start(mfnp_t *m, uint8_t *key) {
 
 static int connect_tcp(mfnp_t *m) {
   m->tcp = socket(AF_INET, SOCK_STREAM, 0);
+  if (m->tcp < 0) { perror("socket"); return -1; }
   int one = 1;
   setsockopt(m->tcp, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
   setsockopt(m->tcp, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
@@ -586,6 +606,9 @@ int main(int argc, char **argv) {
   }
   if (!ip) { fprintf(stderr, "usage: mfnpscan [-r dpi] [-m color|gray] [-s auto|flatbed|adf] [-o dir] [-n name] [-v] [--status|--wait] IP\n"); return 1; }
   if (dpi != 75 && dpi != 150 && dpi != 300 && dpi != 600) dpi = 300;
+  const char *ts = getenv("MFNPSCAN_TIME_SCALE");
+  if (ts && atof(ts) > 0) time_scale = atof(ts);
+  reply_ms = (int)(reply_ms * time_scale) + 1;
 
   mfnp_t m = {0};
   m.addr.sin_family = AF_INET;
@@ -598,6 +621,7 @@ int main(int argc, char **argv) {
   sigaction(SIGTERM, &sa, NULL);
   sigaction(SIGINT, &sa, NULL);
   m.udp = socket(AF_INET, SOCK_DGRAM, 0);
+  if (m.udp < 0) { perror("socket"); return 1; }
   int one = 1;
   setsockopt(m.udp, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
   if (connect(m.udp, (struct sockaddr *)&m.addr, sizeof(m.addr))) { perror("udp"); return 1; }
@@ -611,7 +635,7 @@ int main(int argc, char **argv) {
   }
   uint8_t st[12];
   /* after Start on the panel the printer may need a moment before it grants the session */
-  for (int tries = 0; (rc = open_session(&m, st)) == EXIT_OFFLINE && wait_start && tries < 20 && !cancelled; tries++) sleep(1);
+  for (int tries = 0; (rc = open_session(&m, st)) == EXIT_OFFLINE && wait_start && tries < 20 && !cancelled; tries++) sleep_ms(1000);
   if (cancelled && rc) return EXIT_CANCELLED;
   if (status_only) {
     printf("%s\n", rc ? "offline" : "online");
@@ -654,14 +678,23 @@ int main(int argc, char **argv) {
     int lines;
     uint8_t *img = scan_page(&m, &p, &lines, &info, &rc);
     if (!img) break;
+    if (lines <= 0) {                             /* no image data: don't loop on empty pages */
+      free(img);
+      fprintf(stderr, "INFO: page %d is empty; done\n", page);
+      break;
+    }
     write_pnm(dir, page, &p, img, lines);
     free(img);
+    if (page >= MAX_PAGES) {
+      fprintf(stderr, "ERROR: stopped after %d pages\n", page);
+      break;
+    }
     query_status(&m, st);
     query_status(&m, st);
     if (!adf || info == 0x38 || !has_adf_paper(st)) break;  /* done, or feeder empty */
   }
 abort:
-  reply_ms = 2000;                                 /* don't hang on a scanner that gave up */
+  reply_ms = (int)(2000 * time_scale) + 1;        /* don't hang on a scanner that gave up */
   iclass_cmd(&m, ICLASS_ABORT, NULL, 0, NULL, 0);
   close_session(&m);
   return cancelled ? EXIT_CANCELLED : rc;

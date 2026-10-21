@@ -12,13 +12,25 @@ import SwiftUI
 import SystemConfiguration
 import dnssd
 
+#if SOAK
+// Soak-test build (test/soak): its own name, port and folders, so it runs beside the
+// real app, and timers 20x faster to compress days of polling into hours.
+let appName = "MF4700 Soak Test"
+let oldAppName = "MF4700 Soak Test (old)"
+let printerName = "MF4700 Soak"
+let queueName = "MF4700_Soak"
+let preferredPort = 18631
+let timeScale = 0.05
+#else
 let appName = "Canon MF4780w Print & Scan"
 let oldAppName = "Canon MF4780w AirPrint"           // until v2.0; its data is moved over
 let printerName = "Canon MF4780w"
 let queueName = "Canon_MF4780w"
+let preferredPort = 8631
+let timeScale = 1.0
+#endif
 /// The printer's own Bonjour name first, then any MF4700-series printer on the network.
 let defaultDevice = "dnssd://CanonMF4700 dnssd://*"
-let preferredPort = 8631
 
 // MARK: - Activity log
 
@@ -28,6 +40,24 @@ struct Event: Identifiable {
     let time = Date()
     let text: String
     let kind: Kind
+}
+
+/// Keeps the Mac from idle-sleeping while a job prints or a scan runs: sleep
+/// would cut the connection to the printer.
+final class KeepAwake {
+    private let reason: String
+    private var activity: NSObjectProtocol?
+
+    init(_ reason: String) { self.reason = reason }
+
+    func hold(_ on: Bool) {
+        if on, activity == nil {
+            activity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: reason)
+        } else if !on, let a = activity {
+            ProcessInfo.processInfo.endActivity(a)
+            activity = nil
+        }
+    }
 }
 
 // MARK: - Bridge: AirPrint server + Bonjour + printer status
@@ -43,7 +73,7 @@ final class Bridge: ObservableObject {
     @Published var problem: String?
     @Published var pageCount: Int?              // the printer's lifetime page counter
     @Published var toner: Int?                  // percent, nil = unknown
-    @Published var activeJob: String?
+    @Published var activeJob: String? { didSet { printing.hold(activeJob != nil) } }
     @Published var jobPagesSent = 0             // pages encoded and sent so far
     @Published var jobPagesTotal: Int?          // known once the whole job was sent
     @Published var jobStartCount: Int?          // page counter when the job started
@@ -58,12 +88,20 @@ final class Bridge: ObservableObject {
     private let logURL: URL
     private var server: Process?
     private var dnsRef: DNSServiceRef?
+    private var registrations = 0               // numbers each registration, for its watchdog
+    private var registrationAnswered = false
     private var registeredName = printerName
     private var timer: Timer?
     private var stopping = false
     private var restarts = 0
     private var pending = ""
     private var log: FileHandle?
+    private var logOpened = false
+    private var logSize: UInt64 = 0
+    private var refreshingPrinter = false, refreshingQueue = false
+    private var idleJobTicks = 0                // timer ticks with a job shown but no encoder running
+    private var serving: NSObjectProtocol?      // no App Nap: polls and the scan listener stay on time
+    private let printing = KeepAwake("Printing")
 
     private init() {
         let fm = FileManager.default
@@ -102,6 +140,8 @@ final class Bridge: ObservableObject {
     // MARK: Lifecycle
 
     func start() {
+        serving = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
+                                                        reason: "AirPrint server and scan listener for \(printerName)")
         openLog()
         killOrphan()
         port = Self.freePort(from: preferredPort)
@@ -112,13 +152,38 @@ final class Bridge: ObservableObject {
         launchServer(conf: confURL)
         refreshPrinter()
         refreshQueue()
+        #if SOAK
+        // a main-thread heartbeat with the sizes of what could grow, for the soak driver
+        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.write(String(format: "soak: heartbeat %.3f events=%d pending=%d\n",
+                              Date().timeIntervalSince1970, self.events.count, self.pending.utf8.count))
+        }
+        #endif
         // Status every 30 s, every 5 s while a job is running.
         var tick = 0
-        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 5 * timeScale, repeats: true) { [weak self] _ in
             guard let self else { return }
             tick += 1
             if self.activeJob != nil || tick % 6 == 0 { self.refreshPrinter() }
-            if tick % 6 == 0 { self.refreshQueue() }
+            // only the panel shows it; polling lpstat forever would keep cupsd from idling out
+            if tick % 6 == 0 && PanelWindow.shared.isVisible { self.refreshQueue() }
+            self.checkJobRunning()
+        }
+    }
+
+    /// A job is shown while the server's print command (the encoder) runs. Should
+    /// the line that ends it never arrive, clear it once no command has run for two
+    /// ticks: a stuck job would hide the menu-bar icon and make Quit ask forever.
+    private func checkJobRunning() {
+        guard activeJob != nil, let p = server, p.isRunning else { idleJobTicks = 0; return }
+        var kids = [pid_t](repeating: 0, count: 16)
+        let n = proc_listchildpids(p.processIdentifier, &kids, Int32(MemoryLayout<pid_t>.size * kids.count))
+        idleJobTicks = n > 0 ? 0 : idleJobTicks + 1
+        if idleJobTicks >= 2 {
+            note(.warning, "Job “\(activeJob ?? "")” ended without a status line")
+            activeJob = nil
+            idleJobTicks = 0
         }
     }
 
@@ -127,10 +192,11 @@ final class Bridge: ObservableObject {
         timer?.invalidate()
         unregister()
         if let p = server, p.isRunning {
-            p.terminate()
-            let deadline = Date().addingTimeInterval(3)
-            while p.isRunning && Date() < deadline { usleep(50_000) }
-            if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            // its process group: the server and a job it runs (encoder, nc), no orphans
+            kill(-p.processIdentifier, SIGTERM)
+            let deadline = ProcessInfo.processInfo.systemUptime + 3
+            while p.isRunning && ProcessInfo.processInfo.systemUptime < deadline { usleep(50_000) }
+            if p.isRunning { kill(-p.processIdentifier, SIGKILL) }
         }
         try? FileManager.default.removeItem(at: pidURL)
         write("app quit; AirPrint server stopped\n")
@@ -160,16 +226,23 @@ final class Bridge: ObservableObject {
         p.standardError = pipe
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty else { return }
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil       // EOF: an empty read would repeat forever
+                return
+            }
             DispatchQueue.main.async { self?.consume(data) }
         }
         p.terminationHandler = { [weak self] proc in
+            // a job still running in its group would print again once macOS resends it
+            kill(-proc.processIdentifier, SIGTERM)
             DispatchQueue.main.async { self?.serverExited(proc.terminationStatus) }
         }
         do {
             try p.run()
         } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
             note(.error, "Could not start the AirPrint server: \(error.localizedDescription)")
+            scheduleServerStart(after: 60)
             return
         }
         server = p
@@ -179,7 +252,10 @@ final class Bridge: ObservableObject {
             let up = Self.waitForPort(port, seconds: 8)
             DispatchQueue.main.async {
                 guard up, self.server === p, p.isRunning else {
-                    if !self.stopping { self.note(.error, "The AirPrint server did not start") }
+                    if !self.stopping && self.server === p {
+                        self.note(.error, "The AirPrint server did not start")
+                        if p.isRunning { p.terminate() }  // serverExited starts another
+                    }
                     return
                 }
                 self.serverRunning = true
@@ -196,12 +272,18 @@ final class Bridge: ObservableObject {
         guard !stopping else { return }
         restarts += 1
         if restarts > 5 {
-            note(.error, "The AirPrint server keeps stopping (exit \(status)); see the log")
+            // keep trying, but slowly: printing must come back on its own
+            if restarts == 6 { note(.error, "The AirPrint server keeps stopping (exit \(status)); retrying every minute") }
+            scheduleServerStart(after: 60)
             return
         }
         note(.warning, "The AirPrint server stopped (exit \(status)); restarting")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self, !self.stopping else { return }
+        scheduleServerStart(after: 3)
+    }
+
+    private func scheduleServerStart(after seconds: Double) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds * timeScale) { [weak self] in
+            guard let self, !self.stopping, self.server?.isRunning != true else { return }
             self.port = Self.freePort(from: preferredPort)
             self.launchServer(conf: self.support.appendingPathComponent("mf4700.conf"))
         }
@@ -244,6 +326,7 @@ final class Bridge: ObservableObject {
         add("priority", "0")
         add("UUID", uuid)
 
+        write("app: registering “\(printerName)” (Bonjour, this Mac only) for port \(port)\n")
         var ref: DNSServiceRef?
         let ctx = Unmanaged.passUnretained(self).toOpaque()
         let err = txt.withUnsafeBufferPointer { buf in
@@ -253,16 +336,46 @@ final class Bridge: ObservableObject {
                                registerReply, ctx)
         }
         guard err == kDNSServiceErr_NoError, let ref else {
-            note(.error, "Bonjour registration failed (\(err))")
+            note(.error, "Bonjour registration failed (\(err)); retrying")
+            scheduleRegister()
             return
         }
         DNSServiceSetDispatchQueue(ref, .main)
         dnsRef = ref
+        registrations += 1
+        registrationAnswered = false
+        // mDNSResponder answers within a second; no answer means the registration is lost
+        let number = registrations
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self, self.registrations == number, self.dnsRef != nil, !self.registrationAnswered else { return }
+            self.write("app: no Bonjour reply; registering again\n")
+            self.unregister()
+            self.register()
+        }
     }
 
-    fileprivate func registered(name: String, error: DNSServiceErrorType) {
+    /// Register again a little later, e.g. after mDNSResponder restarted.
+    private func scheduleRegister() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10 * timeScale) { [weak self] in
+            guard let self, !self.stopping, self.serverRunning, self.dnsRef == nil else { return }
+            self.register()
+        }
+    }
+
+    /// Called on the main queue while `ref` is live; answers for a registration that
+    /// was replaced since are ignored.
+    fileprivate func registered(ref: DNSServiceRef?, name: String, error: DNSServiceErrorType) {
+        guard ref == dnsRef else { return }
+        write("app: Bonjour reply for “\(name)”: \(error)\n")
+        registrationAnswered = true
         if error != kDNSServiceErr_NoError {
-            note(.error, "Bonjour registration failed (\(error))")
+            note(.error, "Bonjour registration failed (\(error)); retrying")
+            let number = registrations
+            DispatchQueue.main.async { [weak self] in    // not from inside the reply itself
+                guard let self, self.registrations == number else { return }
+                self.unregister()
+                self.scheduleRegister()
+            }
             return
         }
         registeredName = name
@@ -277,11 +390,14 @@ final class Bridge: ObservableObject {
     // MARK: Printer status (Bonjour + SNMP, via the encoder)
 
     func refreshPrinter() {
+        guard !refreshingPrinter else { return }        // a slow poll must not pile up
+        refreshingPrinter = true
         let encoder = self.encoder, device = self.device
         DispatchQueue.global().async {
-            let r = Self.run(encoder, ["--find", device], timeout: 20)
-            let parts = r.output.split(separator: " ").map(String.init)
+            let r = Self.run(encoder, ["--find", device], timeout: 60)
+            let parts = r.output.split(whereSeparator: \.isWhitespace).map(String.init)   // "… 85\n"
             DispatchQueue.main.async {
+                self.refreshingPrinter = false
                 let found = r.status == 0 && parts.count >= 4
                 if found, self.printerAddress != parts[0] {
                     self.note(.ok, "Printer found at \(parts[0])")
@@ -314,10 +430,15 @@ final class Bridge: ObservableObject {
     }
 
     func refreshQueue() {
+        guard !refreshingQueue else { return }
+        refreshingQueue = true
         let uuid = self.uuid
         DispatchQueue.global().async {
             let r = Self.run("/usr/bin/lpstat", ["-v"])
-            DispatchQueue.main.async { self.queueAdded = r.output.contains("uuid=\(uuid)") }
+            DispatchQueue.main.async {
+                self.refreshingQueue = false
+                if r.status == 0 { self.queueAdded = r.output.contains("uuid=\(uuid)") }
+            }
         }
     }
 
@@ -342,7 +463,7 @@ final class Bridge: ObservableObject {
     // MARK: Server output → activity
 
     private func consume(_ data: Data) {
-        log?.write(data)
+        write(data)
         pending += String(decoding: data, as: UTF8.self)
         while let nl = pending.firstIndex(of: "\n") {
             let line = String(pending[..<nl])
@@ -403,19 +524,51 @@ final class Bridge: ObservableObject {
         write("app: \(text)\n")
     }
 
+    #if SOAK
+    private let logLimit: UInt64 = 256_000
+    #else
+    private let logLimit: UInt64 = 2_000_000
+    #endif
+
     private func openLog() {
         let fm = FileManager.default
         try? fm.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if let size = try? fm.attributesOfItem(atPath: logURL.path)[.size] as? Int, size > 2_000_000 {
-            try? fm.removeItem(at: logURL)
-        }
-        if !fm.fileExists(atPath: logURL.path) { fm.createFile(atPath: logURL.path, contents: nil) }
-        log = try? FileHandle(forWritingTo: logURL)
-        _ = try? log?.seekToEnd()
+        reopenLog()
+        logOpened = true
         write("---- \(Date()) app started (printer UUID \(uuid), device \(device))\n")
     }
 
-    private func write(_ s: String) { log?.write(Data(s.utf8)) }
+    private func reopenLog() {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: logURL.path) { fm.createFile(atPath: logURL.path, contents: nil) }
+        log = try? FileHandle(forWritingTo: logURL)
+        logSize = (try? log?.seekToEnd()) ?? 0
+    }
+
+    /// The log is kept below its limit while the app runs for weeks: the older half
+    /// goes to "<name>.log.1" (replacing the previous one).
+    private func rotateLog() {
+        try? log?.close()
+        let fm = FileManager.default
+        let old = logURL.appendingPathExtension("1")
+        try? fm.removeItem(at: old)
+        try? fm.moveItem(at: logURL, to: old)
+        fm.createFile(atPath: logURL.path, contents: nil)
+        log = try? FileHandle(forWritingTo: logURL)
+        logSize = 0
+        write("---- \(Date()) log continued (older lines in \(old.lastPathComponent))\n")
+    }
+
+    private func write(_ s: String) { write(Data(s.utf8)) }
+
+    private func write(_ data: Data) {
+        if log == nil && logOpened { reopenLog() }      // e.g. a rotation failed on a full disk
+        guard let log else { return }
+        // write(contentsOf:) throws instead of raising an exception, e.g. on a full disk
+        guard (try? log.write(contentsOf: data)) != nil else { return }
+        logSize += UInt64(data.count)
+        if logSize > logLimit { rotateLog() }
+    }
 
     func logLine(_ s: String) { write("app: \(s)\n") }
 
@@ -443,8 +596,8 @@ final class Bridge: ObservableObject {
     }
 
     static func waitForPort(_ port: Int, seconds: Double) -> Bool {
-        let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
+        let deadline = ProcessInfo.processInfo.systemUptime + seconds
+        while ProcessInfo.processInfo.systemUptime < deadline {
             let s = socket(AF_INET, SOCK_STREAM, 0)
             var addr = sockaddr_in()
             addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -465,6 +618,9 @@ final class Bridge: ObservableObject {
 
     struct RunResult { let status: Int32; let output: String }
 
+    /// Run a helper and collect its output, stopping it after `timeout` seconds: it
+    /// is read as it comes, so a child that hangs (or leaves a process holding its
+    /// output open) can't block the caller.
     static func run(_ path: String, _ args: [String], timeout: Double = 15) -> RunResult {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
@@ -472,19 +628,42 @@ final class Bridge: ObservableObject {
         let out = Pipe()
         p.standardOutput = out
         p.standardError = out
-        do { try p.run() } catch { return RunResult(status: -1, output: error.localizedDescription) }
-        let deadline = Date().addingTimeInterval(timeout)
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        while p.isRunning && Date() < deadline { usleep(50_000) }
-        if p.isRunning { p.terminate() }
-        p.waitUntilExit()
+        let lock = NSLock()
+        var data = Data()
+        let closed = DispatchSemaphore(value: 0), exited = DispatchSemaphore(value: 0)
+        out.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else {
+                handle.readabilityHandler = nil
+                closed.signal()
+                return
+            }
+            lock.lock()
+            data.append(chunk)
+            lock.unlock()
+        }
+        p.terminationHandler = { _ in exited.signal() }
+        do { try p.run() } catch {
+            out.fileHandleForReading.readabilityHandler = nil
+            return RunResult(status: -1, output: error.localizedDescription)
+        }
+        if exited.wait(timeout: .now() + timeout) == .timedOut {
+            p.terminate()
+            if exited.wait(timeout: .now() + 2) == .timedOut {
+                kill(p.processIdentifier, SIGKILL)
+                exited.wait()
+            }
+        }
+        if closed.wait(timeout: .now() + 2) == .timedOut { out.fileHandleForReading.readabilityHandler = nil }
+        lock.lock()
+        defer { lock.unlock() }
         return RunResult(status: p.terminationStatus, output: String(decoding: data, as: UTF8.self))
     }
 }
 
-private let registerReply: DNSServiceRegisterReply = { _, _, error, name, _, _, context in
-    guard let context, let name else { return }
-    let bridge = Unmanaged<Bridge>.fromOpaque(context).takeUnretainedValue()
-    let registered = String(cString: name)
-    DispatchQueue.main.async { bridge.registered(name: registered, error: error) }
+/// Delivered on the main queue (DNSServiceSetDispatchQueue).
+private let registerReply: DNSServiceRegisterReply = { ref, _, error, name, _, _, context in
+    guard let context else { return }
+    Unmanaged<Bridge>.fromOpaque(context).takeUnretainedValue()
+        .registered(ref: ref, name: name.map { String(cString: $0) } ?? printerName, error: error)
 }

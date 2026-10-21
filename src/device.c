@@ -55,21 +55,42 @@ static pid_t spawn(char *const argv[], int stdin_fd, int stdout_fd, int stderr_f
   return rc ? -1 : pid;
 }
 
-/* waitpid with timeout; kills the child when it expires. Returns exit status or -1. */
+/* Seconds for timeouts: monotonic, so a clock change can't end or stretch a wait. */
+static time_t mono(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec;
+}
+
+/* The job's parent (ippeveprinter). Once it is gone nobody waits for this job:
+ * stop instead of holding the printer's only data session for half an hour. */
+static pid_t parent_pid;
+
+static int orphaned(void) { return parent_pid && getppid() != parent_pid; }
+
+/* waitpid with timeout; when it expires the child gets SIGTERM, then SIGKILL, and
+ * is always reaped. Returns exit status or -1. */
 static int wait_child(pid_t pid, int timeout_s) {
   int status;
-  for (long i = 0; i < (long)timeout_s * 10; i++) {
+  for (long i = 0; i < (long)timeout_s * 10 && !orphaned(); i++) {
     pid_t r = waitpid(pid, &status, WNOHANG);
     if (r == pid) return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    if (r < 0) return -1;
+    if (r < 0 && errno != EINTR) return -1;
     usleep(100000);
   }
   kill(pid, SIGTERM);
-  waitpid(pid, &status, 0);
+  for (int i = 0; i < 20; i++) {
+    if (waitpid(pid, &status, WNOHANG) == pid) return -1;
+    usleep(100000);
+  }
+  kill(pid, SIGKILL);
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+    ;
   return -1;
 }
 
-/* Run a command and capture its stdout. Returns its exit status or -1. */
+/* Run a command and capture its stdout. Returns its exit status or -1. The read
+ * has the same deadline: a child that hangs must not hang its caller. */
 static int run_capture(char *const argv[], char *buf, size_t buflen, int timeout_s) {
   int p[2];
   buf[0] = '\0';
@@ -79,13 +100,22 @@ static int run_capture(char *const argv[], char *buf, size_t buflen, int timeout
   pid_t pid = spawn(argv, -1, p[1], -1);
   close(p[1]);
   size_t n = 0;
-  if (pid > 0) {
-    ssize_t r;
-    while (n + 1 < buflen && (r = read(p[0], buf + n, buflen - 1 - n)) > 0) n += (size_t)r;
+  time_t end = mono() + timeout_s;
+  while (pid > 0 && n + 1 < buflen) {
+    long left = (long)(end - mono());
+    struct pollfd pf = { p[0], POLLIN, 0 };
+    int ready = left > 0 ? poll(&pf, 1, (int)left * 1000) : 0;
+    if (ready < 0 && errno == EINTR) continue;
+    if (ready <= 0) break;
+    ssize_t r = read(p[0], buf + n, buflen - 1 - n);
+    if (r < 0 && errno == EINTR) continue;
+    if (r <= 0) break;
+    n += (size_t)r;
   }
   buf[n] = '\0';
   close(p[0]);
-  return pid > 0 ? wait_child(pid, timeout_s) : -1;
+  long left = (long)(end - mono());
+  return pid > 0 ? wait_child(pid, left > 1 ? (int)left : 1) : -1;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -247,8 +277,8 @@ static int nc_open(const char *ip, int port) {
   char buf[1024];
   size_t n = 0;
   int connected = 0;
-  time_t end = time(NULL) + 15;
-  while (!connected && time(NULL) <= end) {
+  time_t end = mono() + 15;
+  while (!connected && mono() <= end) {
     struct pollfd p = { err[0], POLLIN, 0 };
     if (poll(&p, 1, 500) <= 0) continue;
     ssize_t r = read(err[0], buf + n, sizeof(buf) - 1 - n);
@@ -318,7 +348,8 @@ static int try_uris(const char *uris, char *addr, size_t addrlen) {
 }
 
 int device_open(const char *uris, int retry_seconds, char *addr, size_t addrlen) {
-  time_t give_up = time(NULL) + retry_seconds;
+  if (!parent_pid) parent_pid = getppid();
+  time_t give_up = mono() + retry_seconds;
   int announced = 0;
   for (;;) {
     int fd = try_uris(uris, addr, addrlen);
@@ -327,7 +358,7 @@ int device_open(const char *uris, int retry_seconds, char *addr, size_t addrlen)
       fprintf(stderr, "INFO: Connected to printer at %s\n", addr);
       return fd;
     }
-    if (time(NULL) >= give_up) {
+    if (mono() >= give_up || orphaned()) {
       fprintf(stderr, "ERROR: Printer not reachable (%s)\n", uris);
       return -1;
     }
@@ -369,13 +400,24 @@ int device_close(int fd) {
 
 typedef struct { long pages; int status; unsigned errors; int toner; } snmp_state_t;
 
+/* snmpget's agent argument: the printer, or udp:IP:PORT when UFR2LT_SNMP_PORT is
+ * set (soak tests talk to a fake agent on an unprivileged port). */
+static const char *snmp_agent(const char *ip, char *buf, size_t len) {
+  const char *port = getenv("UFR2LT_SNMP_PORT");
+  if (!port || !*port) return ip;
+  snprintf(buf, len, "udp:%s:%s", ip, port);
+  return buf;
+}
+
 static int snmp_poll(const char *ip, snmp_state_t *st) {
-  char out[256];
+  char out[256], agent[96];
   char *argv[] = { SNMPGET, "-v1", "-c", "public", "-t", "2", "-r", "1", "-Oqv", "-Ox", "-Oe",
-                   (char *)ip, OID_PAGES, OID_STATUS, OID_ERRORS, OID_TONER_MAX, OID_TONER, NULL };
+                   (char *)snmp_agent(ip, agent, sizeof(agent)), OID_PAGES, OID_STATUS, OID_ERRORS,
+                   OID_TONER_MAX, OID_TONER, NULL };
   if (run_capture(argv, out, sizeof(out), 10) != 0) return -1;
-  char *l1 = strtok(out, "\n"), *l2 = strtok(NULL, "\n"), *l3 = strtok(NULL, "\n");
-  char *l4 = strtok(NULL, "\n"), *l5 = strtok(NULL, "\n");
+  char *save = NULL;                              /* strtok_r: the monitor thread polls too */
+  char *l1 = strtok_r(out, "\n", &save), *l2 = strtok_r(NULL, "\n", &save), *l3 = strtok_r(NULL, "\n", &save);
+  char *l4 = strtok_r(NULL, "\n", &save), *l5 = strtok_r(NULL, "\n", &save);
   if (!l1 || !l2 || !l3) return -1;
   st->pages = atol(l1);
   st->status = atoi(l2);
@@ -393,8 +435,9 @@ static int snmp_poll(const char *ip, snmp_state_t *st) {
 }
 
 static int snmp_descr_has(const char *ip, const char *text) {
-  char out[256];
-  char *argv[] = { SNMPGET, "-v1", "-c", "public", "-t", "2", "-r", "1", "-Oqv", (char *)ip, OID_DESCR, NULL };
+  char out[256], agent[96];
+  char *argv[] = { SNMPGET, "-v1", "-c", "public", "-t", "2", "-r", "1", "-Oqv",
+                   (char *)snmp_agent(ip, agent, sizeof(agent)), OID_DESCR, NULL };
   return run_capture(argv, out, sizeof(out), 10) == 0 && strstr(out, text) != NULL;
 }
 
@@ -481,20 +524,21 @@ static void *monitor_thread(void *arg) {
 
 device_monitor_t *device_monitor_start(const char *addr) {
   device_monitor_t *m = calloc(1, sizeof(*m));
+  if (!m) return NULL;
   snprintf(m->addr, sizeof(m->addr), "%s", addr);
   pthread_mutex_init(&m->lock, NULL);
   snmp_state_t st;
   if (!snmp_poll(m->addr, &st)) { m->start = m->last = st; m->have = 1; announce(m, st.errors); }
-  pthread_create(&m->thread, NULL, monitor_thread, m);
+  if (pthread_create(&m->thread, NULL, monitor_thread, m)) { pthread_mutex_destroy(&m->lock); free(m); return NULL; }
   return m;
 }
 
 void device_monitor_finish(device_monitor_t *m, int impressions, int timeout_s) {
   if (!m) return;
-  time_t start = time(NULL), deadline = start + timeout_s;
+  time_t start = mono(), deadline = start + timeout_s;
   int idle_polls = 0;
   long reported = -1;
-  while (time(NULL) < deadline) {
+  while (mono() < deadline && !orphaned()) {
     sleep(2);
     pthread_mutex_lock(&m->lock);
     snmp_state_t st = m->last, s0 = m->start;
@@ -509,16 +553,17 @@ void device_monitor_finish(device_monitor_t *m, int impressions, int timeout_s) 
     idle_polls = st.status == 3 ? idle_polls + 1 : 0;
     if (done >= impressions && idle_polls >= 1) break;   /* printed; lingering warnings don't matter */
     if (st.errors & BLOCKING_ERRORS) {             /* keep the job open until the user fixes it */
-      deadline = time(NULL) + 30 * 60;
+      deadline = mono() + 30 * 60;
       idle_polls = 0;
       continue;
     }
-    if (idle_polls >= 5 && time(NULL) - start > 20) break;  /* idle for 10 s: counter may lag */
+    if (idle_polls >= 5 && mono() - start > 20) break;  /* idle for 10 s: counter may lag */
   }
   pthread_mutex_lock(&m->lock);
   m->stop = 1;
   pthread_mutex_unlock(&m->lock);
   pthread_join(m->thread, NULL);
   announce(m, m->last.errors & 0xa000);            /* keep only low-paper/low-toner warnings */
+  pthread_mutex_destroy(&m->lock);
   free(m);
 }

@@ -140,6 +140,12 @@ static int raster_page(cups_raster_t *ras, cups_page_header2_t *h, page_t *pg,
   unsigned w = h->cupsWidth, ht = h->cupsHeight, bpp = h->cupsBitsPerPixel, bpl = h->cupsBytesPerLine;
   int xres = (int)h->HWResolution[0], yres = (int)h->HWResolution[1];
   if (!w || !ht || !bpl || xres <= 0 || yres <= 0) { fprintf(stderr, "ERROR: Bad raster header\n"); return -1; }
+  /* A line must hold w pixels; sizes are capped (66 x 133 in at 600 dpi) so nothing overflows. */
+  if (w > 40000 || ht > 80000 || (bpp != 1 && bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32 && bpp != 48) ||
+      (uint64_t)bpl < ((uint64_t)w * bpp + 7) / 8) {
+    fprintf(stderr, "ERROR: Unsupported raster (%ux%u, %u bits per pixel, %u bytes per line)\n", w, ht, bpp, bpl);
+    return -1;
+  }
   if (!mult) mult = xres == 2 * yres && xres >= 1200 ? 2 : 1;
   double pw = h->cupsPageSize[0] > 0 ? h->cupsPageSize[0] : h->PageSize[0];
   double ph = h->cupsPageSize[1] > 0 ? h->cupsPageSize[1] : h->PageSize[1];
@@ -156,6 +162,7 @@ static int raster_page(cups_raster_t *ras, cups_page_header2_t *h, page_t *pg,
             pg->paper->w_px, pg->paper->h_px, mult, ox, oy);
 
   uint8_t *line = malloc(bpl), *ink = malloc(w);
+  if (!line || !ink) { fprintf(stderr, "ERROR: Out of memory\n"); free(line); free(ink); return -1; }
   int cs = h->cupsColorSpace;
   int additive = !(cs == CUPS_CSPACE_K || cs == CUPS_CSPACE_CMYK || cs == CUPS_CSPACE_KCMY ||
                    cs == CUPS_CSPACE_CMY || cs == CUPS_CSPACE_YMC);
@@ -194,7 +201,7 @@ static int raster_page(cups_raster_t *ras, cups_page_header2_t *h, page_t *pg,
 static int pbm_page(const char *path, page_t *pg, const ufr2lt_paper_t *paper, int mult) {
   FILE *f = fopen(path, "rb");
   if (!f) { perror(path); return -1; }
-  int c1 = getc(f), c2 = getc(f), vals[2], n = 0;
+  int c1 = getc(f), c2 = getc(f), vals[2] = {0, 0}, n = 0;
   if (c1 != 'P' || c2 != '4') { fprintf(stderr, "%s: not a P4 PBM\n", path); fclose(f); return -1; }
   while (n < 2) {
     int c = getc(f);
@@ -207,6 +214,7 @@ static int pbm_page(const char *path, page_t *pg, const ufr2lt_paper_t *paper, i
     else if (c == EOF) break;
   }
   int w = vals[0], h = vals[1];
+  if (n < 2 || w <= 0 || h <= 0) { fprintf(stderr, "%s: bad PBM header\n", path); fclose(f); return -1; }
   if (!paper) paper = ufr2lt_paper_by_size(w * 72.0 / (600 * mult), h * 72.0 / 600, 3.0);
   if (!paper) paper = ufr2lt_paper_fitting(w * 72.0 / (600 * mult), h * 72.0 / 600);
   page_alloc(pg, paper, mult);
