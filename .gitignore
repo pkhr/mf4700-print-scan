@@ -1,0 +1,8 @@
+# build output
+/build/
+/rastertoufr2lt
+/mfnpscan
+*.o
+.DS_Store
+/tools/__pycache__/
+/tools/mkraster

@@ -1,0 +1,75 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.276 841.89] /Contents 4 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> /F2 << /Type /Font /Subtype /Type1 /BaseFont /Times-Bold >> >> >> >>
+endobj
+4 0 obj
+<< /Length 1689 >>
+stream
+BT /F2 28 Tf 60 780 Td (UFR II LT reverse-engineering test) Tj ET
+BT /F1 6 Tf 60 740 Td (The quick brown fox jumps over the lazy dog 0123456789 - size 6pt) Tj ET
+BT /F1 8 Tf 60 724 Td (The quick brown fox jumps over the lazy dog 0123456789 - size 8pt) Tj ET
+BT /F1 10 Tf 60 706 Td (The quick brown fox jumps over the lazy dog 0123456789 - size 10pt) Tj ET
+BT /F1 12 Tf 60 686 Td (The quick brown fox jumps over the lazy dog 0123456789 - size 12pt) Tj ET
+BT /F1 16 Tf 60 664 Td (The quick brown fox jumps over the lazy dog 0123456789 - size 16pt) Tj ET
+BT /F1 20 Tf 60 638 Td (The quick brown fox jumps over the lazy dog 0123456789 - size 20pt) Tj ET
+0.1 g 60 480 80 80 re f
+0.25 g 155 480 80 80 re f
+0.5 g 250 480 80 80 re f
+0.75 g 345 480 80 80 re f
+0.9 g 440 480 80 80 re f
+0 g 1 w
+60 120.0 m 540 440.0 l S
+60 129.6 m 540 430.4 l S
+60 139.2 m 540 420.8 l S
+60 148.8 m 540 411.2 l S
+60 158.4 m 540 401.6 l S
+60 168.0 m 540 392.0 l S
+60 177.6 m 540 382.4 l S
+60 187.2 m 540 372.8 l S
+60 196.8 m 540 363.2 l S
+60 206.4 m 540 353.6 l S
+60 216.0 m 540 344.0 l S
+60 225.6 m 540 334.4 l S
+60 235.2 m 540 324.8 l S
+60 244.8 m 540 315.2 l S
+60 254.4 m 540 305.6 l S
+60 264.0 m 540 296.0 l S
+60 273.6 m 540 286.4 l S
+60 283.2 m 540 276.8 l S
+60 292.8 m 540 267.2 l S
+60 302.4 m 540 257.6 l S
+60 312.0 m 540 248.0 l S
+60 321.6 m 540 238.4 l S
+60 331.2 m 540 228.8 l S
+60 340.8 m 540 219.2 l S
+60 350.4 m 540 209.6 l S
+60 360.0 m 540 200.0 l S
+60 369.6 m 540 190.4 l S
+60 379.2 m 540 180.8 l S
+60 388.8 m 540 171.2 l S
+60 398.4 m 540 161.6 l S
+60 408.0 m 540 152.0 l S
+60 417.6 m 540 142.4 l S
+60 427.2 m 540 132.8 l S
+60 436.8 m 540 123.2 l S
+0 g 0 60 595.276 30 re f
+0.5 g 300 200 250 250 re f 0 g
+endstream
+endobj
+xref
+0 5
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000357 00000 n 
+trailer << /Size 5 /Root 1 0 R >>
+startxref
+2098
+%%EOF
