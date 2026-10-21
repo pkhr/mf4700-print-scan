@@ -73,7 +73,12 @@ final class Bridge: ObservableObject {
     @Published var problem: String?
     @Published var pageCount: Int?              // the printer's lifetime page counter
     @Published var toner: Int?                  // percent, nil = unknown
-    @Published var activeJob: String? { didSet { printing.hold(activeJob != nil) } }
+    @Published var activeJob: String? {
+        didSet {
+            printing.hold(activeJob != nil)
+            if (activeJob == nil) != (oldValue == nil) { schedulePoll() }   // 5 s polls while it prints
+        }
+    }
     @Published var jobPagesSent = 0             // pages encoded and sent so far
     @Published var jobPagesTotal: Int?          // known once the whole job was sent
     @Published var jobStartCount: Int?          // page counter when the job started
@@ -91,7 +96,10 @@ final class Bridge: ObservableObject {
     private var registrations = 0               // numbers each registration, for its watchdog
     private var registrationAnswered = false
     private var registeredName = printerName
-    private var timer: Timer?
+    private var poll: Timer?                    // the next look at the printer (see pollInterval)
+    private var misses = 0                      // looks in a row that didn't find it
+    private var lastSearch: TimeInterval = -60  // uptime of the last full search
+    private var browseRef: DNSServiceRef?       // Bonjour: the printer showing up on the network
     private var stopping = false
     private var restarts = 0
     private var pending = ""
@@ -100,7 +108,6 @@ final class Bridge: ObservableObject {
     private var logSize: UInt64 = 0
     private var refreshingPrinter = false, refreshingQueue = false
     private var idleJobTicks = 0                // timer ticks with a job shown but no encoder running
-    private var serving: NSObjectProtocol?      // no App Nap: polls and the scan listener stay on time
     private let printing = KeepAwake("Printing")
 
     private init() {
@@ -140,8 +147,6 @@ final class Bridge: ObservableObject {
     // MARK: Lifecycle
 
     func start() {
-        serving = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
-                                                        reason: "AirPrint server and scan listener for \(printerName)")
         openLog()
         killOrphan()
         port = Self.freePort(from: preferredPort)
@@ -151,7 +156,7 @@ final class Bridge: ObservableObject {
         try? conf.write(to: confURL, atomically: true, encoding: .utf8)
         launchServer(conf: confURL)
         refreshPrinter()
-        refreshQueue()
+        watchForPrinter()
         #if SOAK
         // a main-thread heartbeat with the sizes of what could grow, for the soak driver
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -160,16 +165,6 @@ final class Bridge: ObservableObject {
                               Date().timeIntervalSince1970, self.events.count, self.pending.utf8.count))
         }
         #endif
-        // Status every 30 s, every 5 s while a job is running.
-        var tick = 0
-        timer = Timer.scheduledTimer(withTimeInterval: 5 * timeScale, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            tick += 1
-            if self.activeJob != nil || tick % 6 == 0 { self.refreshPrinter() }
-            // only the panel shows it; polling lpstat forever would keep cupsd from idling out
-            if tick % 6 == 0 && PanelWindow.shared.isVisible { self.refreshQueue() }
-            self.checkJobRunning()
-        }
     }
 
     /// A job is shown while the server's print command (the encoder) runs. Should
@@ -189,7 +184,9 @@ final class Bridge: ObservableObject {
 
     func stop() {
         stopping = true
-        timer?.invalidate()
+        poll?.invalidate()
+        if let ref = browseRef { DNSServiceRefDeallocate(ref) }
+        browseRef = nil
         unregister()
         if let p = server, p.isRunning {
             // its process group: the server and a job it runs (encoder, nc), no orphans
@@ -389,37 +386,103 @@ final class Bridge: ObservableObject {
 
     // MARK: Printer status (Bonjour + SNMP, via the encoder)
 
+    /// Look at the printer: its status straight over SNMP at the address it had
+    /// (one UDP exchange), else a full search with the encoder (`--find`: Bonjour,
+    /// then SNMP). Then the next look is scheduled.
     func refreshPrinter() {
         guard !refreshingPrinter else { return }        // a slow poll must not pile up
         refreshingPrinter = true
-        let encoder = self.encoder, device = self.device
+        poll?.invalidate()
+        let known = printerAddress, encoder = self.encoder, device = self.device
         DispatchQueue.global().async {
-            let r = Self.run(encoder, ["--find", device], timeout: 60)
-            let parts = r.output.split(whereSeparator: \.isWhitespace).map(String.init)   // "… 85\n"
+            var line = known.flatMap { ip in SNMP.status(ip).map { "\(ip) \($0)" } }
+            var searched = false
+            if line == nil {
+                let r = Self.run(encoder, ["--find", device], timeout: 60)
+                line = r.status == 0 ? r.output : nil
+                searched = true
+            }
+            let parts = (line ?? "").split(whereSeparator: \.isWhitespace).map(String.init)   // "… 85\n"
             DispatchQueue.main.async {
                 self.refreshingPrinter = false
-                let found = r.status == 0 && parts.count >= 4
-                if found, self.printerAddress != parts[0] {
-                    self.note(.ok, "Printer found at \(parts[0])")
-                } else if !found, self.printerAddress != nil || !self.searched {
-                    self.note(.warning, "Printer not found on this network")
-                }
-                self.searched = true
-                self.printerAddress = found ? parts[0] : nil
-                self.printerState = found ? parts[1] : nil
-                if found, let count = Int(parts[2]), count > 0 {
-                    self.pageCount = count
-                    if self.activeJob != nil && self.jobStartCount == nil { self.jobStartCount = count }
-                }
-                self.toner = found && parts.count >= 5 ? Int(parts[4]).flatMap { $0 >= 0 ? $0 : nil } : nil
-                let problem = found ? Self.describe(errorBits: UInt32(parts[3], radix: 16) ?? 0) : nil
-                if problem != self.problem {
-                    if let problem { self.note(.warning, "Printer: \(problem)") }
-                    else if self.problem != nil { self.note(.ok, "Printer: problem cleared") }
-                    self.problem = problem
-                }
+                if searched { self.lastSearch = ProcessInfo.processInfo.systemUptime }
+                self.update(parts.count >= 4 ? parts : nil)
+                self.checkJobRunning()
+                if PanelWindow.shared.isVisible { self.refreshQueue() }
+                self.schedulePoll()
             }
         }
+    }
+
+    /// "IP state pages error-bits toner%"; nil = not found. Published values are
+    /// set only when they change: an unchanged poll redraws nothing.
+    private func update(_ parts: [String]?) {
+        if let parts, printerAddress != parts[0] {
+            note(.ok, "Printer found at \(parts[0])")
+        } else if parts == nil, printerAddress != nil || !searched {
+            note(.warning, "Printer not found on this network")
+        }
+        misses = parts == nil ? misses + 1 : 0
+        set(\.searched, true)
+        set(\.printerAddress, parts?[0])
+        set(\.printerState, parts?[1])
+        if let parts, let count = Int(parts[2]), count > 0 {
+            set(\.pageCount, count)
+            if activeJob != nil && jobStartCount == nil { jobStartCount = count }
+        }
+        set(\.toner, parts.flatMap { $0.count >= 5 ? Int($0[4]) : nil }.flatMap { $0 >= 0 ? $0 : nil })
+        let problem = parts.flatMap { Self.describe(errorBits: UInt32($0[3], radix: 16) ?? 0) }
+        if problem != self.problem {
+            if let problem { note(.warning, "Printer: \(problem)") }
+            else if self.problem != nil { note(.ok, "Printer: problem cleared") }
+            self.problem = problem
+        }
+    }
+
+    private func set<T: Equatable>(_ key: ReferenceWritableKeyPath<Bridge, T>, _ value: T) {
+        if self[keyPath: key] != value { self[keyPath: key] = value }
+    }
+
+    /// Seconds to the next look: 5 while a job prints, 30 while the panel is open,
+    /// else 2 minutes. While the printer isn't found (switched off, maybe for the
+    /// night) only every 5 minutes: Bonjour says when it is back (watchForPrinter).
+    private var pollInterval: Double {
+        if activeJob != nil { return 5 }
+        if printerAddress == nil && searched { return misses < 3 ? 30 : 300 }
+        return PanelWindow.shared.isVisible ? 30 : 120
+    }
+
+    func schedulePoll() {
+        guard !refreshingPrinter, !stopping else { return }    // the poll in flight schedules the next
+        poll?.invalidate()
+        let interval = pollInterval * timeScale
+        poll = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in self?.refreshPrinter() }
+        poll?.tolerance = interval / 10                         // let macOS batch the wakeup
+    }
+
+    /// Bonjour browsing for raw-port printers costs nothing while nothing changes,
+    /// and tells at once when a printer comes on: look then, not minutes later.
+    private func watchForPrinter() {
+        var ref: DNSServiceRef?
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        guard DNSServiceBrowse(&ref, 0, 0, "_pdl-datastream._tcp", "local.", browseReply, ctx) == kDNSServiceErr_NoError,
+              let ref else { return }
+        DNSServiceSetDispatchQueue(ref, .main)
+        browseRef = ref
+    }
+
+    fileprivate func printerAnnounced(error: DNSServiceErrorType, added: Bool) {
+        if error != kDNSServiceErr_NoError {                    // mDNSResponder restarted: browse again
+            if let ref = browseRef { DNSServiceRefDeallocate(ref) }
+            browseRef = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+                guard let self, !self.stopping, self.browseRef == nil else { return }
+                self.watchForPrinter()
+            }
+            return
+        }
+        // a printer appeared while ours is missing: search now (at most every 10 s)
+        if added && printerAddress == nil && ProcessInfo.processInfo.systemUptime - lastSearch > 10 { refreshPrinter() }
     }
 
     // MARK: Print queue on this Mac
@@ -659,6 +722,13 @@ final class Bridge: ObservableObject {
         defer { lock.unlock() }
         return RunResult(status: p.terminationStatus, output: String(decoding: data, as: UTF8.self))
     }
+}
+
+/// Delivered on the main queue (DNSServiceSetDispatchQueue).
+private let browseReply: DNSServiceBrowseReply = { _, flags, _, error, _, _, _, context in
+    guard let context else { return }
+    Unmanaged<Bridge>.fromOpaque(context).takeUnretainedValue()
+        .printerAnnounced(error: error, added: flags & kDNSServiceFlagsAdd != 0)
 }
 
 /// Delivered on the main queue (DNSServiceSetDispatchQueue).

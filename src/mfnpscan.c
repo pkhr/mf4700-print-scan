@@ -515,7 +515,7 @@ static int wait_for_start(mfnp_t *m, uint8_t *key) {
   int listed = 0, failures = 0, wait = 0;
   pid_t parent = getppid();
   for (;;) {
-    for (int i = 0; i < wait * 10 && !cancelled; i++) sleep_ms(100);
+    if (wait && !cancelled) sleep_ms(wait * 1000.0);   /* one sleep per poll; SIGTERM ends it (no SA_RESTART) */
     if (cancelled || getppid() != parent) {        /* app quit or scanning switched off */
       if (listed) notify(m, &d, NOTIFY_CANCEL);
       return cancelled ? EXIT_CANCELLED : 1;

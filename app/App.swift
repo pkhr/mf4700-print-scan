@@ -20,8 +20,11 @@ extension PanelModel {
         m.lastScan = s.lastScan?.lastPathComponent
         if let e = b.events.last(where: { $0.kind != .info }) {
             let notable = e.kind != .ok || e.text.hasPrefix("Saved") || e.text.hasPrefix("Job ")
-            let age = now.timeIntervalSince(e.time)
-            if notable && age < (e.kind == .ok ? 30 : 300) { m.notice = .init(text: e.text, isError: e.kind != .ok) }
+            let lifetime: TimeInterval = e.kind == .ok ? 30 : 300
+            if notable && now.timeIntervalSince(e.time) < lifetime {
+                m.notice = .init(text: e.text, isError: e.kind != .ok)
+                m.noticeExpiry = e.time.addingTimeInterval(lifetime)
+            }
         }
 
         if let phase = s.phase {
@@ -108,7 +111,9 @@ struct LivePanel: View {
     @ObservedObject var scan = ScanController.shared
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 5)) { context in    // lets notices expire
+        // redrawn when the state changes, and once more when a notice should go
+        let expiry = PanelModel.live(bridge, scan).noticeExpiry
+        TimelineView(.explicit(expiry.map { [$0] } ?? [])) { context in
             PanelView(model: .live(bridge, scan, now: context.date), actions: PanelActions(
                 cancelScan: { scan.cancelScan() },
                 openLastScan: { if let url = scan.lastScan { NSWorkspace.shared.open(url) } },
@@ -129,6 +134,7 @@ final class PanelWindow: NSObject, NSWindowDelegate {
 
     func show() {
         Bridge.shared.refreshQueue()                      // "Add to Mac" or the check mark
+        Bridge.shared.refreshPrinter()                    // fresh status, then every 30 s while open
         if window == nil {
             let w = NSWindow(contentRect: NSRect(origin: .zero, size: PanelView.size),
                              styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
@@ -142,9 +148,7 @@ final class PanelWindow: NSObject, NSWindowDelegate {
             w.isReleasedWhenClosed = false
             w.collectionBehavior = [.fullScreenNone]
             w.delegate = self
-            let host = NSHostingView(rootView: LivePanel())
-            host.sizingOptions = []
-            w.contentView = host
+            w.contentView = Self.content()
             // the content fills the whole frame (title bar included): size the frame,
             // keeping a remembered position
             let restored = w.setFrameUsingName("Panel")
@@ -156,6 +160,7 @@ final class PanelWindow: NSObject, NSWindowDelegate {
             w.setFrameAutosaveName("Panel")
             window = w
         }
+        if window?.contentView == nil { window?.contentView = Self.content() }
         #if SOAK
         window?.alphaValue = 0                            // rendered, but invisible and never in the way
         window?.ignoresMouseEvents = true
@@ -173,9 +178,18 @@ final class PanelWindow: NSObject, NSWindowDelegate {
         #endif
     }
 
-    /// Closed (not minimized): leave the Dock, keep the menu-bar icon.
+    private static func content() -> NSView {
+        let host = NSHostingView(rootView: LivePanel())
+        host.sizingOptions = []
+        return host
+    }
+
+    /// Closed (not minimized): leave the Dock, keep the menu-bar icon. The views go
+    /// too, so nothing is redrawn while the panel isn't shown.
     func windowWillClose(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        window?.contentView = nil
+        DispatchQueue.main.async { Bridge.shared.schedulePoll() }   // back to the slower polls
     }
 
     /// Size the frame (title bar included) to the panel; the hosting view may have
@@ -230,11 +244,13 @@ final class StatusItem: NSObject, NSMenuDelegate {
     private func refresh() {
         let m = PanelModel.live(Bridge.shared, ScanController.shared)
         #if SOAK
-        item?.isVisible = false
+        let visible = false
         #else
-        item?.isVisible = Bridge.shared.activeJob == nil
+        let visible = Bridge.shared.activeJob == nil
         #endif
-        item?.button?.toolTip = "\(printerName) — \(m.title)"
+        if item?.isVisible != visible { item?.isVisible = visible }
+        let tip = "\(printerName) — \(m.title)"
+        if item?.button?.toolTip != tip { item?.button?.toolTip = tip }
         guard m.tone.symbol != symbol else { return }
         symbol = m.tone.symbol
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: m.title)
@@ -372,7 +388,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         #else
-        if !LoginItem.launchedAtLogin { PanelWindow.shared.show() }
+        // opened at login, or with --menu-bar-only: no panel, just the menu-bar icon
+        if !LoginItem.launchedAtLogin && !CommandLine.arguments.contains("--menu-bar-only") { PanelWindow.shared.show() }
         #endif
     }
 

@@ -2,6 +2,7 @@
 // Canon MF4780w Print & Scan: SCAN → Computer on the printer → PDF on the Desktop.
 
 import AppKit
+import Combine
 import SwiftUI
 import SystemConfiguration
 
@@ -37,7 +38,8 @@ final class ScanController: ObservableObject {
     }()
 
     private let scanner = Bundle.main.url(forAuxiliaryExecutable: "mfnpscan")?.path ?? ""
-    private var timer: Timer?
+    private var addressWatch: AnyCancellable?
+    private var stopped = false
     private var listener: Process?               // mfnpscan --wait
     private var listenerAddress: String?
     private var listenAgain: TimeInterval = 0     // monotonic (systemUptime): immune to clock changes
@@ -58,12 +60,15 @@ final class ScanController: ObservableObject {
         // settings of the Remote Scanner mode that earlier versions used
         UserDefaults.standard.removeObject(forKey: "ScanQuietUntil")
         UserDefaults.standard.removeObject(forKey: "WatchForScans")
-        timer = Timer.scheduledTimer(withTimeInterval: 3 * timeScale, repeats: true) { [weak self] _ in self?.listen() }
-        timer?.tolerance = 1
+        // (re)start the listener when the printer is found or moves; no timer
+        addressWatch = Bridge.shared.$printerAddress.removeDuplicates().sink { [weak self] _ in
+            DispatchQueue.main.async { self?.listen() }     // once the new address is set
+        }
     }
 
     func stop() {
-        timer?.invalidate()
+        stopped = true
+        addressWatch = nil
         stopListener()
     }
 
@@ -87,12 +92,12 @@ final class ScanController: ObservableObject {
 
     /// Keep one `mfnpscan --wait` running for the printer's current address.
     private func listen() {
-        guard let ip = Bridge.shared.printerAddress else { return }
+        guard !stopped, let ip = Bridge.shared.printerAddress else { return }
         if listener != nil {
             if listenerAddress != ip && !scanning { stopListener() }   // the printer moved
             return
         }
-        guard ProcessInfo.processInfo.systemUptime >= listenAgain else { return }
+        guard ProcessInfo.processInfo.systemUptime >= listenAgain else { return listenLater() }
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("scan-\(UUID().uuidString)")
         let p = Process()
         p.executableURL = URL(fileURLWithPath: scanner)
@@ -139,7 +144,14 @@ final class ScanController: ObservableObject {
             p.terminationHandler = nil
             listenAgain = ProcessInfo.processInfo.systemUptime + 60 * timeScale
             Bridge.shared.logLine("cannot start the scan listener: \(error.localizedDescription)")
+            listenLater()
         }
+    }
+
+    /// Start the listener once `listenAgain` has passed.
+    private func listenLater() {
+        let delay = max(0, listenAgain - ProcessInfo.processInfo.systemUptime)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.05) { [weak self] in self?.listen() }
     }
 
     private func listenerSaid(_ line: String) {
@@ -166,6 +178,7 @@ final class ScanController: ObservableObject {
     }
 
     private func listenerEnded(_ proc: Process, output: String, dir: URL) {
+        defer { listenLater() }                         // a new listener, after listenAgain
         let pressed = phase != nil
         listener = nil
         phase = nil

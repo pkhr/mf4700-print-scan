@@ -51,7 +51,8 @@ in the menu bar only; its Dock icon returns with the panel (menu bar → Show, o
 open the app again). The menu-bar
 icon follows the printer's state, and its menu shows the status and toner level,
 opens the last scan, switches **Open at Login** on or off, and quits the app.
-Opened at login, the app starts in the menu bar without its window. While a job prints, macOS 27's Print Center
+Opened at login (or with `open -a "Canon MF4780w Print & Scan" --args --menu-bar-only`),
+the app starts in the menu bar without its window. While a job prints, macOS 27's Print Center
 shows its own printer icon in the menu bar (a Live Activity), so the app's icon
 steps aside until the job is done.
 
@@ -140,6 +141,11 @@ Settings → Printers & Scanners.
 * macOS Local Network privacy blocks LAN connections from non-Apple helper tools,
   so the encoder hands its byte stream to Apple's `/usr/bin/nc` (one connection per
   job) and reads status with `/usr/bin/snmpget`.
+* Idle, the app costs next to nothing: the printer's status is one SNMP exchange
+  from the app every 2 minutes (30 s while the panel is open, 5 s while a job
+  prints), Bonjour says when the printer comes back after being switched off, and
+  the panel's views are released when it is closed. `mfnpscan` sends the printer
+  the small poll Canon's protocol needs every 4 seconds.
 * `ippeveprinter` invents a new printer UUID on every start. The app pins one, so
   the Mac's queue (`dnssd://…?uuid=`) keeps working across launches.
 * Cancelling a job in the Mac's print queue stops it only before it starts:

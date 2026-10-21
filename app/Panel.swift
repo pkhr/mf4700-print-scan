@@ -24,6 +24,7 @@ struct PanelModel: Equatable {
     var scanName: String?                       // listed under SCAN → Computer as …
     var lastScan: String?                       // file name of the last scan
     var notice: Notice?
+    var noticeExpiry: Date?                     // when the notice should go
 }
 
 struct PanelActions {

@@ -3,11 +3,14 @@
  * procstat - resource use of a process tree, for the soak test.
  *   procstat PID   one line per process in PID's tree:
  *   pid ppid depth footprint_kb resident_kb threads cpu_ms fds zombie peak_kb name
+ *   procstat -e PID...   energy view: pid cpu_ms children_cpu_ms wakeups name
+ *   (wakeups = package-idle + interrupt wakeups; children = reaped child processes)
  */
 #include <libproc.h>
 #include <mach/mach_time.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/proc_info.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
@@ -47,7 +50,21 @@ static void show(pid_t pid, int depth) {
   for (int i = 0; i < n && i < 256; i++) show(kids[i], depth + 1);
 }
 
+static void energy(pid_t pid) {
+  struct rusage_info_v4 ru = {0};
+  char name[64] = "";
+  if (proc_pid_rusage(pid, RUSAGE_INFO_V4, (rusage_info_t *)&ru)) return;
+  proc_name(pid, name, sizeof(name));
+  printf("%d %.1f %.1f %llu %s\n", pid, ticks_to_ms(ru.ri_user_time + ru.ri_system_time),
+         ticks_to_ms(ru.ri_child_user_time + ru.ri_child_system_time),
+         (unsigned long long)(ru.ri_pkg_idle_wkups + ru.ri_interrupt_wkups), name);
+}
+
 int main(int argc, char **argv) {
+  if (argc > 1 && !strcmp(argv[1], "-e")) {
+    for (int i = 2; i < argc; i++) energy(atoi(argv[i]));
+    return 0;
+  }
   for (int i = 1; i < argc; i++) show(atoi(argv[i]), 0);
   return 0;
 }
