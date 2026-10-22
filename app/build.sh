@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
-# Build "Canon MF4780w Print & Scan.app" (universal, ad-hoc signed) into build/.
+# Build "Canon MF4780w Print & Scan.app" (universal, signed: see identity.sh) into build/.
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NAME="Canon MF4780w Print & Scan"
@@ -22,7 +22,14 @@ cp "$ROOT/app/Resources/AppIcon.icns" "$ROOT/app/Resources/printer.png" "$ROOT/a
    "$ROOT/app/Resources/mf4700.conf" "$ROOT/app/Resources/Credits.rtf" "$ROOT/LICENSE" "$APP/Contents/Resources/"
 rm -rf "$TMP"
 
-codesign --force --sign - "$APP/Contents/MacOS/rastertoufr2lt" "$APP/Contents/MacOS/mfnpscan"
-codesign --force --sign - "$APP"
+# A Developer ID signs with the hardened runtime and a secure timestamp, as
+# notarization requires (make-dmg.sh notarizes); without one, ad hoc.
+IDENTITY=$("$ROOT/app/identity.sh")
+sign() {
+  if [ -n "$IDENTITY" ]; then codesign --force --options runtime --timestamp --sign "$IDENTITY" "$@"
+  else codesign --force --options runtime --sign - "$@"; fi
+}
+sign "$APP/Contents/MacOS/rastertoufr2lt" "$APP/Contents/MacOS/mfnpscan"
+sign "$APP"
 codesign --verify --strict "$APP"
 echo "$APP"

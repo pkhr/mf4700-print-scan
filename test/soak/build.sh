@@ -26,6 +26,7 @@ for kv in "CFBundleIdentifier local.mf4700-airprint.soak" "CFBundleExecutable $N
 done
 cp "$ROOT/app/Resources/AppIcon.icns" "$ROOT/app/Resources/printer.png" "$ROOT/app/Resources/printer-large.png" \
    "$ROOT/app/Resources/mf4700.conf" "$APP/Contents/Resources/"
-codesign --force --sign - "$APP/Contents/MacOS/rastertoufr2lt" "$APP/Contents/MacOS/mfnpscan"
-codesign --force --sign - "$APP"
+# hardened runtime, as in the notarized release
+codesign --force --options runtime --sign - "$APP/Contents/MacOS/rastertoufr2lt" "$APP/Contents/MacOS/mfnpscan"
+codesign --force --options runtime --sign - "$APP"
 echo "$APP"
