@@ -38,9 +38,8 @@ any app → macOS AirPrint driver → localhost:8631 (ippeveprinter, started by 
 ## Use
 
 1. Open the disk image, drag **Canon MF4780w Print & Scan** to Applications and open
-   it (or install it with Homebrew, above). The app is not notarized, so macOS blocks the first launch: click **Open
-   Anyway** in System Settings → Privacy & Security, then open it again. Allow it to
-   find devices on your local network when macOS asks.
+   it (or install it with Homebrew, above). Allow it to find devices on your local
+   network when macOS asks.
 2. The first time, click **Add to Mac** in its panel, or add "Canon MF4780w" in
    System Settings → Printers & Scanners.
 3. Print from any app. Keep the app running while printing. Jobs sent while it is
@@ -98,8 +97,8 @@ name (System Settings → General → Sharing → Local hostname). Choose anothe
 ```sh
 make            # encoder + scanner client (universal binaries)
 make test       # byte-exact check against Canon's driver output (needs jbigkit)
-./app/build.sh  # -> build/Canon MF4780w Print & Scan.app (universal, ad-hoc signed)
-./app/make-dmg.sh  # -> build/Canon MF4780w Print & Scan <version>.dmg, to hand out
+./app/build.sh  # -> build/Canon MF4780w Print & Scan.app (universal, signed)
+./app/make-dmg.sh  # -> build/Canon MF4780w Print & Scan <version>.dmg, signed and notarized
 ./app/Snapshot/run.sh  # renders the panel's states to build/snapshots/*.png
 ./app/Snapshot/make-icon.sh  # renders app/Resources/AppIcon.icns (printer on the dark stage)
 ```
@@ -127,9 +126,13 @@ Bonjour, printer status), `app/Scanner.swift` (SCAN → Computer → PDF),
 `app/Panel.swift` (the panel's views, driven by a plain `PanelModel`) and
 `app/App.swift` (window, menu-bar item, menus).
 
-The app is ad-hoc signed (no Developer ID), so it runs as is on the Mac it was built
-on. On other Macs, macOS blocks the first launch of a downloaded copy until it is
-allowed in System Settings → Privacy & Security → Open Anyway.
+Releases are signed with a Developer ID and notarized by Apple. `app/build.sh` signs
+with the keychain's "Developer ID Application" identity (or `$SIGN_IDENTITY`), using
+the hardened runtime; `app/make-dmg.sh` then has the app and the disk image notarized
+and staples the tickets, with notarytool credentials stored once as a keychain
+profile (`$NOTARY_PROFILE`, see the script). Without a Developer ID both are signed
+ad hoc: such a build runs on the Mac that built it, and elsewhere only after Open
+Anyway in System Settings → Privacy & Security.
 
 ## Remove
 
